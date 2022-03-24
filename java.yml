@@ -1,0 +1,153 @@
+stages:
+  - CodeBuild
+  - DockerBuild-sub-app
+  - Clean-images
+  - notify
+variables:
+  GIT_STRATEGY: fetch
+
+before_script:
+  - aws ecr get-login-password --region ap-southeast-1 | docker login --username AWS --password-stdin $REGISTRY_URL
+  - export CURRENT_DATE=$(date '+%Y%m%d')
+  - >
+    if [ -z ${CI_COMMIT_TAG} ]; then
+      export container_tag=${CI_COMMIT_SHORT_SHA}
+    else
+      export container_tag=${CI_COMMIT_TAG}
+    fi
+  - >
+    case $CI_PIPELINE_SOURCE in
+      'merge_request_event')
+        # 当merge触发时设置branch name 为目标branch
+        export BRANCH_NAME=$CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+        echo 'merge_request_event'
+        ;;
+      'push')
+        if [ "X$CI_COMMIT_BRANCH" == "X" ]; then
+          BRANCH_NAME=$CI_COMMIT_TAG
+          echo 'tag'
+        else
+          BRANCH_NAME=${CI_COMMIT_BRANCH}-${CI_COMMIT_SHORT_SHA}
+          echo 'branch'
+        fi
+        export BRANCH_NAME=$BRANCH_NAME
+        ;;
+      'web')
+        if [ "X$CI_COMMIT_BRANCH" == "X" ]; then
+          BRANCH_NAME=$CI_COMMIT_TAG
+          echo 'tag'
+        else
+          BRANCH_NAME=${CI_COMMIT_BRANCH}-${CI_COMMIT_SHORT_SHA}
+          echo 'branch'
+        fi
+        export BRANCH_NAME=$BRANCH_NAME
+        ;;      
+      '*')
+        export BRANCH_NAME='undefined'
+        ;;
+    esac
+  - >
+    export tag="${CURRENT_DATE}-${CI_PIPELINE_ID}-${BRANCH_NAME}"
+
+  
+.DockerBuild-sub:
+  script:
+    - if [ -d "tmp/$app_name" ]; then rm -rf tmp/$app_name; else mkdir -pv tmp/$app_name; fi
+    - docker cp tmp_${CI_PROJECT_NAME}_container-$CI_PIPELINE_ID:$app_build_path/$app_package tmp/$app_name/
+    - >
+      cat > tmp/$app_name/Dockerfile << EOF
+        FROM dkr.ecr.ap-southeast-1.amazonaws.com/openjdk:apmv1
+        WORKDIR /bit
+        ADD . .
+        EXPOSE 80 
+        ENTRYPOINT [ "java", "-jar", "$app_package" ]
+      EOF
+    - cd tmp/$app_name && docker build --tag $REGISTRY_URL/$app_name:$tag  --tag $REGISTRY_URL/$app_name:latest  --label version=$container_tag --label message="$CI_COMMIT_MESSAGE" --label pipeline.id=$CI_PIPELINE_ID	--label build.user="$GITLAB_USER_NAME" .  && cd -
+    - aws ecr describe-repositories --repository-names ${app_name} || aws ecr create-repository --repository-name ${app_name}
+    - docker push $REGISTRY_URL/$app_name:$tag
+    # - docker rmi -f $(docker images | grep $REGISTRY_URL/$app_name |grep $tag | awk '{print $3}') || true
+  only:
+    - master
+    - with-ci
+    - tags
+    - merge_requests
+    - dev
+    - stg
+
+
+build-all:
+  stage: CodeBuild
+  script:
+    # - > 
+    #   if [ -d "/tmp/.m2" ]; then
+    #     cp -rf /tmp/.m2 .
+    #   fi
+    - docker build --tag $REGISTRY_URL/${CI_PROJECT_NAME}-all:$tag  --label version=$tag --label message="$CI_COMMIT_MESSAGE" --label pipeline.id=$CI_PIPELINE_ID	--label build.user="$GITLAB_USER_NAME" --target builder .
+    - docker run -d --name tmp_${CI_PROJECT_NAME}_container-$CI_PIPELINE_ID $REGISTRY_URL/${CI_PROJECT_NAME}-all:$tag sleep 7200
+  only:
+    - master
+    - with-ci
+    - tags
+    - merge_requests
+    - dev
+    - stg
+
+build-app:
+  stage: DockerBuild-sub-app
+  variables:
+    app_name: "app"
+    app_package: "app.jar"
+    app_build_path: "/build/app/app/target"
+  extends: .DockerBuild-sub
+
+
+
+
+Clean-images:
+  stage: Clean-images
+  script:
+    # - echo "backup latest m2 repo to /tmp/"
+    # # - docker run -d --name tmp_bit_container $REGISTRY_URL/${CI_PROJECT_NAME}-all:$container_tag sleep 3600
+    # - sudo docker cp tmp_bit_container-$CI_PIPELINE_ID:/root/.m2 /tmp/
+    - docker rm -f  tmp_bit_container-$CI_PIPELINE_ID || true
+    #删除编译镜像
+    - docker rmi -f $(docker images | grep $REGISTRY_URL/${CI_PROJECT_NAME}-all |grep $tag | awk '{print $3}') || true
+    #删除业务镜像
+    - docker rmi -f $(docker images | grep $REGISTRY_URL |grep $tag | awk '{print $3}') || true
+
+    - echo "temp container deleted."
+  only:
+  - master
+  - with-ci
+  - tags
+  - merge_requests
+  - dev
+  - stg
+  when: always
+
+notifyFailWeChat:
+  stage: notify
+  script:
+    - curl 'https://qyapi.weixin.qq.com/cgi-bin/webhook' -H 'Content-Type:application/json' -d "{\"msgtype\":\"markdown\",\"markdown\":{\"content\":\"java项目构建结果:<font color=\\\"warning\\\">失败</font>\n>本次构建由:$GITLAB_USER_NAME 触发\n>项目名称:${CI_PROJECT_NAME}\n>提交号:$CI_COMMIT_SHORT_SHA\n>提交日志:$CI_COMMIT_MESSAGE\n>构建分支:$CI_COMMIT_BRANCH\n>构建标签:$CI_COMMIT_TAG\n>容器标签:$tag\n>流水线地址:[$CI_PIPELINE_URL]($CI_PIPELINE_URL)\"}}"
+
+  only:
+    - master
+    - with-ci
+    - tags
+    - merge_requests
+    - dev
+    - stg
+  when: on_failure
+
+notifySuccessWeChat:
+  stage: notify
+  script:
+    - curl 'https://qyapi.weixin.qq.com/cgi-bin/webhook' -H 'Content-Type:application/json' -d "{\"msgtype\":\"markdown\",\"markdown\":{\"content\":\"java项目构建结果:<font color=\\\"info\\\">成功</font>\n>本次构建由:$GITLAB_USER_NAME 触发\n>项目名称:${CI_PROJECT_NAME}\n>提交号:$CI_COMMIT_SHORT_SHA\n>提交日志:$CI_COMMIT_MESSAGE\n>构建分支:$CI_COMMIT_BRANCH\n>构建标签:$CI_COMMIT_TAG\n>容器标签:$tag\n>流水线地址:[$CI_PIPELINE_URL]($CI_PIPELINE_URL)\"}}"
+  only:
+    - master
+    - with-ci
+    - tags
+    - merge_requests
+    - dev
+    - stg
+  when: on_success
